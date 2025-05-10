@@ -1,0 +1,35 @@
+// Circuit DAG
+digraph {
+	rankdir=LR
+	g0 [label="and
+and_1
+(and_gate)" color=red]
+	g1 [label="or
+or_2
+(or_gate)" color=red]
+	g2 [label="and
+and_3
+(complex_gate)" color=red]
+	g3 [label="or
+or_4
+(complex_gate)" color=red]
+	g4 [label="xor
+xor_5
+(complex_gate)" color=red]
+	g5 [label="and
+and_6
+(top)" color=red]
+	g6 [label="or
+or_7
+(top)" color=red]
+	g7 [label="xor
+xor_8
+(top)" color=red]
+	g8 [label="dff
+d1
+(top)" color=red]
+	g9 [label="dff
+d2
+(top)" color=red]
+	g8 -> g9
+}

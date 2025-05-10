@@ -1,0 +1,4 @@
+pyverilog>=1.3.0
+networkx>=2.6.0
+graphviz>=0.17
+python-sat>=0.1.7.dev6 
