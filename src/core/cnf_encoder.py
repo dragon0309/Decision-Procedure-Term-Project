@@ -1,19 +1,26 @@
 from typing import Dict, List, Set, Any, Optional, Tuple
 import networkx as nx
-from dataclasses import dataclass
 from pysat.formula import CNF
-
-@dataclass
-class CNFClause:
-    """Represents a CNF clause with optional comment."""
-    literals: List[int]
-    comment: Optional[str] = None
+from .models import FaultModel, CNFClause
 
 class CNFEncoder:
     """Encodes a circuit DAG into CNF format."""
     
-    def __init__(self, dag: nx.DiGraph):
+    def __init__(self, dag: nx.DiGraph, fault_model: Optional[FaultModel] = None):
+        """
+        Initialize the encoder.
+        
+        Args:
+            dag: Circuit DAG
+            fault_model: Fault injection model parameters
+        """
         self.dag = dag
+        self.fault_model = fault_model or FaultModel(
+            max_faults_per_cycle=3,
+            max_cycles=1,
+            allowed_fault_types={"bit_flip", "set_1", "set_0"},
+            allowed_gate_types={"logic", "memory"}
+        )
         self.var_map: Dict[str, int] = {}  # wire/gate -> SAT variable
         self.clauses: List[CNFClause] = []
         self.var_counter = 1  # Start from 1 (0 is reserved)
@@ -208,7 +215,9 @@ class CNFEncoder:
         control_var = self.var_map[control_var_name]
         select_var = self.var_map[select_var_name]
         output = self.var_map[gate_id]
-        original_output = self.var_map[gate_data["original_output"]]
+        
+        # Get original output if available, otherwise use gate output
+        original_output = self.var_map.get(gate_data.get("original_output", gate_id))
         
         # Fault injection logic:
         # output = (control_var ? faulty_output : original_output)
@@ -249,23 +258,70 @@ class CNFEncoder:
         cnf.to_file(filename)
     
     def add_constraint_max_faults(self, max_faults: int) -> None:
-        """Add constraint: sum of control variables <= max_faults."""
+        """Add constraint: sum of control variables <= max_faults per cycle."""
         # Get control variables from nodes that have fault gadgets
-        control_vars = []
-        for node in self.dag.nodes():
-            node_data = self.dag.nodes[node]
-            if "fault_control" in node_data:
-                control_var = node_data["fault_control"]
-                if control_var in self.var_map:
-                    control_vars.append(self.var_map[control_var])
+        for t in range(self.fault_model.max_cycles):
+            cycle_control_vars = []
+            for node in self.dag.nodes():
+                node_data = self.dag.nodes[node]
+                if "fault_control" in node_data:
+                    control_var = f"{node_data['fault_control']}_t{t}"
+                    if control_var in self.var_map:
+                        cycle_control_vars.append(self.var_map[control_var])
+            
+            # Add at-most-k constraint for this cycle
+            for i in range(len(cycle_control_vars)):
+                for j in range(i + 1, len(cycle_control_vars)):
+                    if i + j >= max_faults:
+                        self.clauses.append(CNFClause(
+                            literals=[-cycle_control_vars[i], -cycle_control_vars[j]],
+                            comment=f"At-most-{max_faults} constraint for cycle {t}"
+                        ))
+
+    def add_nc_time_constraint(self, time_control_vars: Dict[int, List[str]], max_active_cycles: int) -> None:
+        """
+        Add constraint to limit the number of active fault injection cycles.
         
-        # Add at-most-k constraint using sequential counter encoding
-        # This is a simplified version - in practice, you'd want to use
-        # a more efficient encoding like the sequential counter
-        for i in range(len(control_vars)):
-            for j in range(i + 1, len(control_vars)):
-                if i + j >= max_faults:
+        Args:
+            time_control_vars: Dictionary mapping time indices to lists of control variables
+            max_active_cycles: Maximum number of cycles where faults can be active
+        """
+        # Create variables for each time slice indicating if any fault is active
+        time_active_vars = {}
+        for t in time_control_vars:
+            time_active_var = f"active_t{t}"
+            self.var_map[time_active_var] = self.var_counter
+            time_active_vars[t] = self.var_counter
+            self.var_counter += 1
+            
+            # Ensure all control variables are in the variable map
+            control_vars = time_control_vars[t]
+            control_var_ids = []
+            for cv in control_vars:
+                if cv not in self.var_map:
+                    self.var_map[cv] = self.var_counter
+                    self.var_counter += 1
+                control_var_ids.append(self.var_map[cv])
+            
+            # Encode: time_active_var ↔ (control_var1 ∨ control_var2 ∨ ...)
+            # Add clauses for OR condition
+            for cv_id in control_var_ids:
+                self.clauses.append(CNFClause(
+                    literals=[-cv_id, time_active_vars[t]],
+                    comment=f"Time {t} active if control var {cv_id} is active"
+                ))
+            
+            self.clauses.append(CNFClause(
+                literals=[-time_active_vars[t]] + control_var_ids,
+                comment=f"Time {t} active only if some control var is active"
+            ))
+        
+        # Add at-most-k constraint on active cycles
+        active_cycle_vars = list(time_active_vars.values())
+        for i in range(len(active_cycle_vars)):
+            for j in range(i + 1, len(active_cycle_vars)):
+                if i + j >= max_active_cycles:
                     self.clauses.append(CNFClause(
-                        literals=[-control_vars[i], -control_vars[j]],
-                        comment=f"At-most-{max_faults} constraint"
+                        literals=[-active_cycle_vars[i], -active_cycle_vars[j]],
+                        comment=f"At-most-{max_active_cycles} active cycles"
                     )) 
