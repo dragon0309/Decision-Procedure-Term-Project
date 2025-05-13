@@ -74,23 +74,34 @@ class ModuleFlattener:
             if isinstance(item, (Input, Output, Wire)):
                 # Handle bit ranges
                 if hasattr(item, 'width') and item.width is not None:
-                    msb = item.width.msb.value
-                    lsb = item.width.lsb.value
-                    width = abs(msb - lsb) + 1
-                    
-                    # Create individual wire entries for each bit
-                    if hasattr(item, 'name'):
-                        base_name = item.name
-                        for i in range(width):
-                            bit_name = f"{base_name}[{i}]"
-                            self.wire_map[bit_name] = bit_name
-                    elif hasattr(item, 'names'):
-                        for name in item.names:
-                            if isinstance(name, Identifier):
-                                base_name = name.name
-                                for i in range(width):
-                                    bit_name = f"{base_name}[{i}]"
-                                    self.wire_map[bit_name] = bit_name
+                    try:
+                        # Convert string values to integers
+                        msb = int(item.width.msb.value) if isinstance(item.width.msb, IntConst) else int(item.width.msb)
+                        lsb = int(item.width.lsb.value) if isinstance(item.width.lsb, IntConst) else int(item.width.lsb)
+                        width = abs(msb - lsb) + 1
+                        
+                        # Create individual wire entries for each bit
+                        if hasattr(item, 'name'):
+                            base_name = item.name
+                            for i in range(width):
+                                bit_name = f"{base_name}[{i}]"
+                                self.wire_map[bit_name] = bit_name
+                        elif hasattr(item, 'names'):
+                            for name in item.names:
+                                if isinstance(name, Identifier):
+                                    base_name = name.name
+                                    for i in range(width):
+                                        bit_name = f"{base_name}[{i}]"
+                                        self.wire_map[bit_name] = bit_name
+                    except (ValueError, TypeError) as e:
+                        print(f"Warning: Could not parse width for {item.name}: {e}")
+                        # Default to single bit if width parsing fails
+                        if hasattr(item, 'name'):
+                            self.wire_map[item.name] = item.name
+                        elif hasattr(item, 'names'):
+                            for name in item.names:
+                                if isinstance(name, Identifier):
+                                    self.wire_map[name.name] = name.name
                 else:
                     # Handle single-bit wires
                     if hasattr(item, 'name'):

@@ -1,7 +1,8 @@
 from typing import Dict, List, Set, Any, Optional, Tuple
 import networkx as nx
 from pysat.formula import CNF
-from .models import FaultModel, CNFClause
+from .fault_model import FaultModel, FaultType, GateType
+import itertools
 
 class CNFEncoder:
     """Encodes a circuit DAG into CNF format."""
@@ -18,19 +19,36 @@ class CNFEncoder:
         self.fault_model = fault_model or FaultModel(
             max_faults_per_cycle=3,
             max_cycles=1,
-            allowed_fault_types={"bit_flip", "set_1", "set_0"},
-            allowed_gate_types={"logic", "memory"}
+            fault_types={FaultType.BIT_FLIP, FaultType.SET_1, FaultType.SET_0},
+            gate_types=GateType.BOTH
         )
         self.var_map: Dict[str, int] = {}  # wire/gate -> SAT variable
-        self.clauses: List[CNFClause] = []
+        self.clauses: List[List[int]] = []
         self.var_counter = 1  # Start from 1 (0 is reserved)
         self._cnf = None  # Cache for CNF formula
+        
+        # Initialize cycle variables
+        self._init_cycle_variables()
     
-    def get_cnf(self) -> CNF:
-        """Get the CNF formula."""
+    def _init_cycle_variables(self) -> None:
+        """Initialize variables for cycle tracking."""
+        for t in range(self.fault_model.max_cycles):
+            cycle_var = f"cycle_active_t{t}"
+            self.var_map[cycle_var] = self._get_next_var()
+    
+    def _get_next_var(self) -> int:
+        """Get next available variable ID."""
+        var_id = self.var_counter
+        self.var_counter += 1
+        return var_id
+    
+    def get_cnf(self) -> Tuple[List[List[int]], Dict[str, int]]:
+        """Get CNF formula and variable mapping."""
         if self._cnf is None:
-            self._cnf, _ = self.encode()
-        return self._cnf
+            self._cnf = CNF()
+            for clause in self.clauses:
+                self._cnf.append(clause)
+        return self.clauses, self.var_map
     
     def get_var_map(self) -> Dict[str, int]:
         """Get the variable mapping."""
@@ -50,7 +68,7 @@ class CNFEncoder:
         # Create CNF formula
         cnf = CNF()
         for clause in self.clauses:
-            cnf.append(clause.literals)
+            cnf.append(clause)
         
         return cnf, self.var_map
     
@@ -125,77 +143,41 @@ class CNFEncoder:
     def _encode_and_gate(self, inputs: List[int], output: int, gate_id: str) -> None:
         """Encode AND gate: (A & B) -> Y"""
         # Y -> (A & B)
-        self.clauses.append(CNFClause(
-            literals=[-output] + inputs,
-            comment=f"AND gate {gate_id}: Y -> (A & B)"
-        ))
+        self.clauses.append([-output] + inputs)
         # (A & B) -> Y
         for inp in inputs:
-            self.clauses.append(CNFClause(
-                literals=[-inp, output],
-                comment=f"AND gate {gate_id}: A -> Y"
-            ))
+            self.clauses.append([-inp, output])
     
     def _encode_or_gate(self, inputs: List[int], output: int, gate_id: str) -> None:
         """Encode OR gate: (A | B) -> Y"""
         # Y -> (A | B)
         for inp in inputs:
-            self.clauses.append(CNFClause(
-                literals=[-output, inp],
-                comment=f"OR gate {gate_id}: Y -> A"
-            ))
+            self.clauses.append([-output, inp])
         # (A | B) -> Y
-        self.clauses.append(CNFClause(
-            literals=[output] + [-inp for inp in inputs],
-            comment=f"OR gate {gate_id}: (A | B) -> Y"
-        ))
+        self.clauses.append([output] + [-inp for inp in inputs])
     
     def _encode_xor_gate(self, inputs: List[int], output: int, gate_id: str) -> None:
         """Encode XOR gate: (A ^ B) -> Y"""
         # Y -> (A ^ B)
-        self.clauses.append(CNFClause(
-            literals=[-output, inputs[0], inputs[1]],
-            comment=f"XOR gate {gate_id}: Y -> (A ^ B) 1"
-        ))
-        self.clauses.append(CNFClause(
-            literals=[-output, -inputs[0], -inputs[1]],
-            comment=f"XOR gate {gate_id}: Y -> (A ^ B) 2"
-        ))
+        self.clauses.append([-output, inputs[0], inputs[1]])
+        self.clauses.append([-output, -inputs[0], -inputs[1]])
         # (A ^ B) -> Y
-        self.clauses.append(CNFClause(
-            literals=[output, -inputs[0], -inputs[1]],
-            comment=f"XOR gate {gate_id}: (A ^ B) -> Y 1"
-        ))
-        self.clauses.append(CNFClause(
-            literals=[output, inputs[0], inputs[1]],
-            comment=f"XOR gate {gate_id}: (A ^ B) -> Y 2"
-        ))
+        self.clauses.append([output, -inputs[0], -inputs[1]])
+        self.clauses.append([output, inputs[0], inputs[1]])
     
     def _encode_not_gate(self, input_var: int, output: int, gate_id: str) -> None:
         """Encode NOT gate: ~A -> Y"""
         # Y <-> ~A
-        self.clauses.append(CNFClause(
-            literals=[-output, -input_var],
-            comment=f"NOT gate {gate_id}: Y -> ~A"
-        ))
-        self.clauses.append(CNFClause(
-            literals=[output, input_var],
-            comment=f"NOT gate {gate_id}: ~A -> Y"
-        ))
+        self.clauses.append([-output, -input_var])
+        self.clauses.append([output, input_var])
     
     def _encode_dff_gate(self, inputs: List[int], output: int, gate_id: str) -> None:
         """Encode DFF: D -> Q (next cycle)"""
         # For DFF, we need to handle the clock and state
         # This is a simplified version - in practice, you'd need to handle
         # the clock domain and state transitions properly
-        self.clauses.append(CNFClause(
-            literals=[-inputs[0], output],  # D -> Q
-            comment=f"DFF {gate_id}: D -> Q"
-        ))
-        self.clauses.append(CNFClause(
-            literals=[inputs[0], -output],  # ~D -> ~Q
-            comment=f"DFF {gate_id}: ~D -> ~Q"
-        ))
+        self.clauses.append([-inputs[0], output])  # D -> Q
+        self.clauses.append([inputs[0], -output])  # ~D -> ~Q
     
     def _encode_fault_gadget(self, gate_id: str) -> None:
         """Encode fault injection gadget."""
@@ -221,36 +203,18 @@ class CNFEncoder:
         
         # Fault injection logic:
         # output = (control_var ? faulty_output : original_output)
-        self.clauses.append(CNFClause(
-            literals=[-control_var, -output, original_output],
-            comment=f"Fault gadget {gate_id}: control=0 -> original"
-        ))
-        self.clauses.append(CNFClause(
-            literals=[-control_var, output, -original_output],
-            comment=f"Fault gadget {gate_id}: control=0 -> original"
-        ))
+        self.clauses.append([-control_var, -output, original_output])
+        self.clauses.append([-control_var, output, -original_output])
         
         # Add clauses for different fault types
         for fault_type in gate_data["fault_types"]:
             if fault_type == "bit_flip":
-                self.clauses.append(CNFClause(
-                    literals=[control_var, -select_var, -output, -original_output],
-                    comment=f"Fault gadget {gate_id}: bit flip"
-                ))
-                self.clauses.append(CNFClause(
-                    literals=[control_var, -select_var, output, original_output],
-                    comment=f"Fault gadget {gate_id}: bit flip"
-                ))
+                self.clauses.append([control_var, -select_var, -output, -original_output])
+                self.clauses.append([control_var, -select_var, output, original_output])
             elif fault_type == "set_1":
-                self.clauses.append(CNFClause(
-                    literals=[control_var, select_var, output],
-                    comment=f"Fault gadget {gate_id}: set to 1"
-                ))
+                self.clauses.append([control_var, select_var, output])
             elif fault_type == "set_0":
-                self.clauses.append(CNFClause(
-                    literals=[control_var, select_var, -output],
-                    comment=f"Fault gadget {gate_id}: set to 0"
-                ))
+                self.clauses.append([control_var, select_var, -output])
     
     def to_dimacs(self, filename: str) -> None:
         """Write CNF formula to DIMACS format."""
@@ -273,10 +237,7 @@ class CNFEncoder:
             for i in range(len(cycle_control_vars)):
                 for j in range(i + 1, len(cycle_control_vars)):
                     if i + j >= max_faults:
-                        self.clauses.append(CNFClause(
-                            literals=[-cycle_control_vars[i], -cycle_control_vars[j]],
-                            comment=f"At-most-{max_faults} constraint for cycle {t}"
-                        ))
+                        self.clauses.append([-cycle_control_vars[i], -cycle_control_vars[j]])
 
     def add_nc_time_constraint(self, time_control_vars: Dict[int, List[str]], max_active_cycles: int) -> None:
         """
@@ -306,22 +267,113 @@ class CNFEncoder:
             # Encode: time_active_var ↔ (control_var1 ∨ control_var2 ∨ ...)
             # Add clauses for OR condition
             for cv_id in control_var_ids:
-                self.clauses.append(CNFClause(
-                    literals=[-cv_id, time_active_vars[t]],
-                    comment=f"Time {t} active if control var {cv_id} is active"
-                ))
+                self.clauses.append([-cv_id, time_active_vars[t]])
             
-            self.clauses.append(CNFClause(
-                literals=[-time_active_vars[t]] + control_var_ids,
-                comment=f"Time {t} active only if some control var is active"
-            ))
+            self.clauses.append([-time_active_vars[t]] + control_var_ids)
         
         # Add at-most-k constraint on active cycles
         active_cycle_vars = list(time_active_vars.values())
         for i in range(len(active_cycle_vars)):
             for j in range(i + 1, len(active_cycle_vars)):
                 if i + j >= max_active_cycles:
-                    self.clauses.append(CNFClause(
-                        literals=[-active_cycle_vars[i], -active_cycle_vars[j]],
-                        comment=f"At-most-{max_active_cycles} active cycles"
-                    )) 
+                    self.clauses.append([-active_cycle_vars[i], -active_cycle_vars[j]])
+
+    def add_per_cycle_constraints(self) -> None:
+        """Add constraints for maximum faults per cycle."""
+        for t in range(self.fault_model.max_cycles):
+            cycle_var = f"cycle_active_t{t}"
+            if cycle_var not in self.var_map:
+                self.var_map[cycle_var] = self._get_next_var()
+            
+            # Get all control variables for this cycle
+            control_vars = []
+            for node in self.dag.nodes():
+                if self.dag.nodes[node]['category'] in ['logic', 'memory']:
+                    c_var = f"c_{node}_t{t}"
+                    if c_var not in self.var_map:
+                        self.var_map[c_var] = self._get_next_var()
+                    control_vars.append(self.var_map[c_var])
+            
+            # Add at-most-k constraint
+            if len(control_vars) > self.fault_model.max_faults_per_cycle:
+                self._add_at_most_k_constraint(control_vars, self.fault_model.max_faults_per_cycle)
+    
+    def add_max_cycles_constraint(self) -> None:
+        """Add constraint for maximum number of active cycles."""
+        cycle_vars = []
+        for t in range(self.fault_model.max_cycles):
+            cycle_var = f"cycle_active_t{t}"
+            if cycle_var not in self.var_map:
+                self.var_map[cycle_var] = self._get_next_var()
+            cycle_vars.append(self.var_map[cycle_var])
+        
+        # Add at-most-k constraint for cycles
+        if len(cycle_vars) > self.fault_model.max_cycles:
+            self._add_at_most_k_constraint(cycle_vars, self.fault_model.max_cycles)
+    
+    def _add_at_most_k_constraint(self, vars: List[int], k: int) -> None:
+        """Add at-most-k constraint using sequential counter encoding."""
+        # TODO: Implement more efficient encoding
+        # For now, use naive encoding
+        for subset in itertools.combinations(vars, k + 1):
+            self.clauses.append([-v for v in subset])
+    
+    def add_fault_gadget_constraints(self) -> None:
+        """Add constraints for fault gadgets."""
+        for node in self.dag.nodes():
+            if self.dag.nodes[node]['category'] in ['logic', 'memory']:
+                for t in range(self.fault_model.max_cycles):
+                    # Add control variable if not exists
+                    c_var = f"c_{node}_t{t}"
+                    if c_var not in self.var_map:
+                        self.var_map[c_var] = self._get_next_var()
+                    
+                    # Add select variable if not exists
+                    s_var = f"s_{node}_t{t}"
+                    if s_var not in self.var_map:
+                        self.var_map[s_var] = self._get_next_var()
+                    
+                    # Add fault variable if not exists
+                    f_var = f"f_{node}_t{t}"
+                    if f_var not in self.var_map:
+                        self.var_map[f_var] = self._get_next_var()
+                    
+                    # Add constraints for fault injection
+                    # If control is 0, fault is 0
+                    self.clauses.append([-self.var_map[c_var], -self.var_map[f_var]])
+                    # If control is 1, fault is 1
+                    self.clauses.append([self.var_map[c_var], self.var_map[f_var]])
+    
+    def add_output_mismatch_constraints(self, protected_dag: nx.DiGraph) -> None:
+        """Add constraints for output mismatch detection."""
+        # TODO: Implement output mismatch constraints
+        pass
+    
+    def _encode_at_most_k(self, vars: List[int], k: int) -> None:
+        """Encode at-most-k constraint using sequential counter encoding."""
+        if k >= len(vars):
+            return  # No constraint needed
+        
+        # Create auxiliary variables for each position
+        aux_vars = []
+        for i in range(len(vars) - 1):
+            aux_vars.append(self.var_counter)
+            self.var_counter += 1
+        
+        # Encode sequential counter
+        for i in range(len(vars)):
+            # First variable
+            if i == 0:
+                self.clauses.append([-vars[0], aux_vars[0]])
+            # Last variable
+            elif i == len(vars) - 1:
+                self.clauses.append([-vars[-1], -aux_vars[-1]])
+            # Middle variables
+            else:
+                self.clauses.append([-vars[i], aux_vars[i]])
+                self.clauses.append([-aux_vars[i-1], aux_vars[i]])
+                self.clauses.append([-vars[i], -aux_vars[i-1]])
+        
+        # Add k+1 constraint
+        if k < len(vars):
+            self.clauses.append([-aux_vars[k]]) 

@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import networkx as nx
 from .sat_solver import SATSolver, solve_cnf, solve_and_report
 from .cnf_encoder import CNFEncoder
-from .models import FaultModel, FaultGadget
+from .fault_model import FaultModel, FaultType, GateType
 
 @dataclass
 class FaultGadget:
@@ -13,137 +13,90 @@ class FaultGadget:
     select_var: Optional[str] = None  # s_i: type of fault (if multiple types supported)
     fault_types: List[str] = None  # List of supported fault types
 
-@dataclass
-class FaultModel:
-    """Fault injection model parameters."""
-    max_faults_per_cycle: int  # ne
-    max_cycles: int  # nc
-    allowed_fault_types: Set[str]  # T
-    allowed_gate_types: Set[str]  # \ell
-
 class GadgetTransformer:
-    """Transforms a circuit DAG by adding fault injection gadgets."""
+    """Transforms a DAG by adding fault gadgets to eligible gates."""
     
-    def __init__(self, 
-                 dag: nx.DiGraph, 
-                 fault_points: Set[str],
-                 fault_model: Optional[FaultModel] = None):
-        """
-        Initialize the transformer.
-        
-        Args:
-            dag: Circuit DAG
-            fault_points: Set of gate IDs where faults can be injected
-            fault_model: Fault injection model parameters
-        """
+    def __init__(self, dag: nx.DiGraph, fault_model: FaultModel):
+        """Initialize transformer with DAG and fault model."""
         self.dag = dag
-        self.fault_points = fault_points
-        self.fault_model = fault_model or FaultModel(
-            max_faults_per_cycle=3,
-            max_cycles=1,
-            allowed_fault_types={"bit_flip", "set_1", "set_0"},
-            allowed_gate_types={"logic", "memory"}
-        )
-        self.control_vars: Dict[str, List[str]] = {}  # gate -> [control_vars]
-        self.time_control_vars: Dict[int, List[str]] = {}  # cycle -> [control_vars]
-        self.transformed_dag = nx.DiGraph()
-        self.var_counter = 0
+        self.fault_model = fault_model
+        self.time_control_vars: Dict[int, List[str]] = {}  # t -> [c1_t, c2_t, ...]
+        self.time_select_vars: Dict[int, List[str]] = {}  # t -> [s1_t, s2_t, ...]
+        self.gate_fault_vars: Dict[str, Dict[int, str]] = {}  # gate_id -> {t -> f_t}
+        self.next_var_id = 1
     
-    def transform(self) -> nx.DiGraph:
-        """Transform the circuit by adding fault gadgets."""
-        transformed = self.dag.copy()
-        
-        # Add fault gadgets to eligible gates
-        for node in list(transformed.nodes()):
-            if self._is_fault_eligible(node):
-                self._add_fault_gadget(transformed, node)
-        
-        self.transformed_dag = transformed
-        return transformed
+    def _get_next_var(self) -> int:
+        """Get next available variable ID."""
+        var_id = self.next_var_id
+        self.next_var_id += 1
+        return var_id
     
-    def _is_fault_eligible(self, gate_id: str) -> bool:
+    def _is_gate_eligible(self, gate_id: str) -> bool:
         """Check if a gate is eligible for fault injection."""
-        if gate_id not in self.fault_points:
-            return False
-            
-        # Check gate type
         gate_data = self.dag.nodes[gate_id]
-        gate_type = gate_data["type"]
-        
-        if gate_type == "dff" and "memory" not in self.fault_model.allowed_gate_types:
-            return False
-        if gate_type in {"and", "or", "xor", "not"} and "logic" not in self.fault_model.allowed_gate_types:
-            return False
-            
-        return True
+        return self.fault_model.is_gate_type_allowed(gate_data['category'])
     
-    def _add_fault_gadget(self, dag: nx.DiGraph, gate_id: str) -> None:
-        """Add fault injection gadget to a gate."""
-        gate_data = dag.nodes[gate_id]
+    def _add_fault_gadget(self, gate_id: str, t: int) -> None:
+        """Add fault gadget for a gate at time t."""
+        if gate_id not in self.gate_fault_vars:
+            self.gate_fault_vars[gate_id] = {}
         
-        # Store original output
-        if "output" in gate_data:
-            gate_data["original_output"] = gate_data["output"]
+        # Create control and select variables for this time step
+        c_var = f"c_{gate_id}_t{t}"
+        s_var = f"s_{gate_id}_t{t}"
+        f_var = f"f_{gate_id}_t{t}"
         
-        # Create control variables for each cycle
-        control_vars = []
-        for t in range(self.fault_model.max_cycles):
-            control_var = f"c{gate_id}_t{t}"
-            select_var = f"s{gate_id}_t{t}"
-            
-            # Add to time-indexed control variables
-            if t not in self.time_control_vars:
-                self.time_control_vars[t] = []
-            self.time_control_vars[t].append(control_var)
-            
-            control_vars.append(control_var)
-            
-            # Add variables to DAG
-            gate_data["fault_control"] = control_var
-            gate_data["fault_select"] = select_var
-            gate_data["fault_types"] = list(self.fault_model.allowed_fault_types)
+        # Store variables
+        if t not in self.time_control_vars:
+            self.time_control_vars[t] = []
+            self.time_select_vars[t] = []
         
-        self.control_vars[gate_id] = control_vars
+        self.time_control_vars[t].append(c_var)
+        self.time_select_vars[t].append(s_var)
+        self.gate_fault_vars[gate_id][t] = f_var
+        
+        # Add fault gadget to DAG
+        gate_data = self.dag.nodes[gate_id]
+        fault_type = next(iter(self.fault_model.fault_types))  # For now, use first fault type
+        
+        # Create fault gadget node
+        gadget_id = f"{gate_id}_fault_t{t}"
+        self.dag.add_node(gadget_id, 
+                         type="fault_gadget",
+                         control_var=c_var,
+                         select_var=s_var,
+                         fault_var=f_var,
+                         fault_type=fault_type.value,
+                         time=t)
+        
+        # Connect gadget to original gate
+        self.dag.add_edge(gate_id, gadget_id)
+        
+        # Update original gate's output to come from gadget
+        for succ in list(self.dag.successors(gate_id)):
+            if succ != gadget_id:
+                self.dag.add_edge(gadget_id, succ)
+                self.dag.remove_edge(gate_id, succ)
     
-    def get_control_vars(self) -> Dict[str, List[str]]:
-        """Get mapping from gates to their control variables."""
-        return self.control_vars
+    def transform(self) -> None:
+        """Transform DAG by adding fault gadgets to eligible gates."""
+        # Add fault gadgets for each eligible gate at each time step
+        for gate_id in self.dag.nodes():
+            if self._is_gate_eligible(gate_id):
+                for t in range(self.fault_model.max_cycles):
+                    self._add_fault_gadget(gate_id, t)
     
-    def get_time_control_vars(self) -> Dict[int, List[str]]:
-        """Get mapping from cycles to control variables active in that cycle."""
+    def get_control_vars(self) -> Dict[int, List[str]]:
+        """Get control variables indexed by time."""
         return self.time_control_vars
     
-    def get_fault_gadgets(self) -> Dict[str, FaultGadget]:
-        """Get all fault gadgets."""
-        fault_gadgets = {}
-        for gate_id, control_vars in self.control_vars.items():
-            for t, control_var in enumerate(control_vars):
-                select_var = f"s{gate_id}_t{t}"
-                fault_gadgets[f"{gate_id}_t{t}"] = FaultGadget(
-                    original_gate_id=gate_id,
-                    control_var=control_var,
-                    select_var=select_var,
-                    fault_types=list(self.fault_model.allowed_fault_types)
-                )
-        return fault_gadgets
+    def get_select_vars(self) -> Dict[int, List[str]]:
+        """Get select variables indexed by time."""
+        return self.time_select_vars
     
-    def to_json(self) -> Dict[str, Any]:
-        """Convert the transformed circuit to JSON format."""
-        return {
-            "fault_points": list(self.fault_points),
-            "control_vars": self.control_vars,
-            "time_control_vars": self.time_control_vars,
-            "fault_gadgets": {
-                gate_id: {
-                    "control_vars": control_vars,
-                    "fault_types": fault_types
-                }
-                for gate_id, control_vars in self.control_vars.items()
-                for t, control_var in enumerate(control_vars)
-                for fault_type in self.fault_model.allowed_fault_types
-                for fault_types in [list(self.fault_model.allowed_fault_types)]
-            }
-        }
+    def get_fault_vars(self) -> Dict[str, Dict[int, str]]:
+        """Get fault variables indexed by gate and time."""
+        return self.gate_fault_vars
 
 # Example usage
 if __name__ == "__main__":
@@ -151,11 +104,11 @@ if __name__ == "__main__":
     
     # Parse and transform the circuit
     dag = parse_verilog_to_dag("test_circuit.v")
-    transformer = GadgetTransformer(dag.graph, dag.fault_points)
-    transformed_dag = transformer.transform()
+    transformer = GadgetTransformer(dag.graph, dag.fault_model)
+    transformer.transform()
     
     # Encode to CNF
-    encoder = CNFEncoder(transformed_dag)
+    encoder = CNFEncoder(dag)
     encoder.add_constraint_max_faults(3)  # Limit to 3 faults
     cnf = encoder.get_cnf()
     var_map = encoder.get_var_map()

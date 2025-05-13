@@ -1,0 +1,14 @@
+{
+  "vulnerable": false,
+  "fault_model": {
+    "max_faults_per_cycle": 2,
+    "max_cycles": 3,
+    "fault_types": [
+      "set_1",
+      "bit_flip"
+    ],
+    "gate_types": "logic"
+  },
+  "num_clauses": 0,
+  "num_vars": 3
+}
