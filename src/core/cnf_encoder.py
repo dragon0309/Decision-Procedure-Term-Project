@@ -26,6 +26,7 @@ class CNFEncoder:
         self.clauses: List[List[int]] = []
         self.var_counter = 1  # Start from 1 (0 is reserved)
         self._cnf = None  # Cache for CNF formula
+        self.mismatch_variables: Dict[str, int] = {}  # Dictionary to store mismatch variables
         
         # Initialize cycle variables
         self._init_cycle_variables()
@@ -344,36 +345,59 @@ class CNFEncoder:
                     # If control is 1, fault is 1
                     self.clauses.append([self.var_map[c_var], self.var_map[f_var]])
     
+    def _get_node_variable(self, node: str, protected: bool = False) -> int:
+        """Get the SAT variable for a node, creating it if it doesn't exist."""
+        # For protected nodes, use a different naming convention
+        if protected:
+            var_name = f"{node}_protected"
+        else:
+            var_name = node
+            
+        # Check if the variable already exists
+        if var_name not in self.var_map:
+            self.var_map[var_name] = self._get_next_var()
+            
+        return self.var_map[var_name]
+    
+    def _create_fresh_variable(self) -> int:
+        """Create a fresh SAT variable."""
+        return self._get_next_var()
+
     def add_output_mismatch_constraints(self, protected_dag: nx.DiGraph) -> None:
         """Add constraints for output mismatch detection."""
-        # TODO: Implement output mismatch constraints
-        pass
-    
-    def _encode_at_most_k(self, vars: List[int], k: int) -> None:
-        """Encode at-most-k constraint using sequential counter encoding."""
-        if k >= len(vars):
-            return  # No constraint needed
+        # Get all output nodes from both the original and protected DAGs
+        original_outputs = [n for n in self.dag.nodes() if self.dag.out_degree(n) == 0]
+        protected_outputs = [n for n in protected_dag.nodes() if protected_dag.out_degree(n) == 0]
         
-        # Create auxiliary variables for each position
-        aux_vars = []
-        for i in range(len(vars) - 1):
-            aux_vars.append(self.var_counter)
-            self.var_counter += 1
-        
-        # Encode sequential counter
-        for i in range(len(vars)):
-            # First variable
-            if i == 0:
-                self.clauses.append([-vars[0], aux_vars[0]])
-            # Last variable
-            elif i == len(vars) - 1:
-                self.clauses.append([-vars[-1], -aux_vars[-1]])
-            # Middle variables
-            else:
-                self.clauses.append([-vars[i], aux_vars[i]])
-                self.clauses.append([-aux_vars[i-1], aux_vars[i]])
-                self.clauses.append([-vars[i], -aux_vars[i-1]])
-        
-        # Add k+1 constraint
-        if k < len(vars):
-            self.clauses.append([-aux_vars[k]]) 
+        # Create mismatch variables for each output pair
+        for orig_node, prot_node in zip(original_outputs, protected_outputs):
+            # Get the output variables for both nodes
+            orig_var = self._get_node_variable(orig_node)
+            prot_var = self._get_node_variable(prot_node, protected=True)
+            
+            # Create a mismatch variable
+            mismatch_var = self._create_fresh_variable()
+            self.mismatch_variables[f"{orig_node}_{prot_node}"] = mismatch_var
+            
+            # Add constraint: mismatch_var <-> (orig_var XOR prot_var)
+            # This means mismatch_var is true when outputs differ
+            
+            # mismatch_var -> (orig_var XOR prot_var)
+            # Equivalent to: ~mismatch_var \/ (orig_var XOR prot_var)
+            # Which expands to: ~mismatch_var \/ (orig_var /\ ~prot_var) \/ (~orig_var /\ prot_var)
+            
+            # First clause: ~mismatch_var \/ orig_var \/ prot_var
+            self.clauses.append([-mismatch_var, orig_var, prot_var])
+            
+            # Second clause: ~mismatch_var \/ ~orig_var \/ ~prot_var  
+            self.clauses.append([-mismatch_var, -orig_var, -prot_var])
+            
+            # (orig_var XOR prot_var) -> mismatch_var
+            # Equivalent to: ~(orig_var XOR prot_var) \/ mismatch_var
+            # Which expands to: (~orig_var \/ prot_var) /\ (orig_var \/ ~prot_var) \/ mismatch_var
+            
+            # Third clause: orig_var \/ ~prot_var \/ mismatch_var
+            self.clauses.append([orig_var, -prot_var, mismatch_var])
+            
+            # Fourth clause: ~orig_var \/ prot_var \/ mismatch_var
+            self.clauses.append([-orig_var, prot_var, mismatch_var]) 

@@ -1,0 +1,11 @@
+{
+    "verilog_file": "./examples/alu.v",
+    "max_faults": 2,
+    "max_cycles": 3,
+    "fault_types": [
+        "bit_flip",
+        "set_1"
+    ],
+    "gate_types": "logic",
+    "output": "results.json"
+}
